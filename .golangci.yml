@@ -1,0 +1,35 @@
+version: "2"
+
+linters:
+  enable:
+    - govet           # catches suspicious constructs (printf mismatches, unreachable code)
+    - staticcheck     # broad static analysis: dead code, deprecated APIs, logic bugs
+    - errcheck        # flags ignored error return values
+    - ineffassign     # flags assignments whose value is never used
+    - unused          # flags unexported identifiers that are never referenced
+    - gochecknoinits  # bans init() functions (hidden execution, hard to test)
+    - wrapcheck       # errors from external packages must be wrapped with context
+    - contextcheck    # context.Context must be passed through call chains correctly
+    - gocritic        # various style and correctness checks, e.g. for if statements that could be simplified
+    - gosec           # security checks, e.g. for hardcoded credentials or unsafe temp file usage
+    - dupl            # detects code clones (configurable minimum token count, set to 100 here)
+    - gocyclo         # checks code complexity (configurable max complexity, set to 15 here)
+    - goconst
+
+  settings:
+    errcheck:
+      check-type-assertions: true  # flag unchecked x.(T) assertions
+
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - wrapcheck
+          - errcheck
+          - dupl
+          - gocyclo
+
+formatters:
+  enable:
+    - gofmt           # checks for code that is not gofmt-ed
+    - goimports       # checks for missing or ungrouped imports
