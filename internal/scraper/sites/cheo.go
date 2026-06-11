@@ -4,10 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/adrien2121/GoProject/internal/clock"
 	"github.com/adrien2121/GoProject/internal/domain"
+	"github.com/adrien2121/GoProject/internal/httpclient"
+	"github.com/adrien2121/GoProject/internal/repository"
+	"github.com/adrien2121/GoProject/internal/runner"
 	"github.com/adrien2121/GoProject/internal/scraper"
 )
 
@@ -19,31 +23,37 @@ const (
 	cheoInterval = 15 * time.Minute
 )
 
-type cheoScraper struct {
+type CHEOScraper struct {
 	scraper.BaseScraper
-	client HTTPGetter
+	client httpclient.Getter
 	apiURL string
 	clock  clock.Clock
 }
 
-var _ scraper.Scraper = (*cheoScraper)(nil)
+// Compile-time check: CHEOScraper must satisfy runner.Runnable.
+var _ runner.Runnable = (*CHEOScraper)(nil)
 
 // NewCHEOScraper wires the CHEO scraper. apiURL is injected so tests can point at
 // an httptest.Server; clock is injected so tests can control the timestamp on
 // every emitted snapshot (needed for the trend window and anomaly baseline).
-func NewCHEOScraper(client HTTPGetter, apiURL string, c clock.Clock) scraper.Scraper {
-	return &cheoScraper{
-		BaseScraper: scraper.NewBase(domain.HospitalIDCHEO, cheoInterval),
+// repo and log are passed through to BaseScraper so each Run can save snapshots
+// without the scheduler holding the repository.
+func NewCHEOScraper(client httpclient.Getter, apiURL string, c clock.Clock, repo repository.WaitTimeRepository, log *slog.Logger) *CHEOScraper {
+	return &CHEOScraper{
+		BaseScraper: scraper.NewBase(domain.HospitalIDCHEO, cheoInterval, repo, log),
 		client:      client,
 		apiURL:      apiURL,
 		clock:       c,
 	}
 }
 
-func (s *cheoScraper) Scrape(ctx context.Context) ([]domain.WaitTimeSnapshot, error) {
+// Run fetches the current CHEO wait-time payload, builds a snapshot, and
+// hands it to the BaseScraper save helper. Returning an error feeds the
+// scheduler's backoff counter; returning nil resets it.
+func (s *CHEOScraper) Run(ctx context.Context) error {
 	body, err := s.client.Get(ctx, s.apiURL)
 	if err != nil {
-		return nil, fmt.Errorf("cheoScraper.Scrape: %w", err)
+		return fmt.Errorf("cheoScraper.Run: %w", err)
 	}
 
 	var resp struct {
@@ -52,18 +62,23 @@ func (s *cheoScraper) Scrape(ctx context.Context) ([]domain.WaitTimeSnapshot, er
 		PatientCount   int     `json:"patientCount"`
 	}
 	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, fmt.Errorf("cheoScraper.Scrape parse json: %w", err)
+		return fmt.Errorf("cheoScraper.Run parse json: %w", err)
 	}
-	if resp.LongestWaitMin == 0 {
-		return nil, fmt.Errorf("cheoScraper.Scrape: longestWaitMin is 0 or missing")
+	// aveWaitMin represents expected triage-to-doctor time for a new arrival.
+	// longestWaitMin is the worst patient currently waiting and is misleading
+	// as a user-facing estimate, so we ignore it for now.
+	if resp.AveWaitMin == 0 {
+		return fmt.Errorf("cheoScraper.Run: aveWaitMin is 0 or missing")
 	}
 
 	now := s.clock.Now()
-	return []domain.WaitTimeSnapshot{{
+	snaps := []domain.WaitTimeSnapshot{{
 		HospitalID:  s.HospitalID(),
-		WaitMinutes: int(resp.LongestWaitMin),
+		WaitMinutes: int(resp.AveWaitMin),
 		Category:    domain.WaitCategoryTriageToDoctor,
 		RecordedAt:  now,
 		ScrapedAt:   now,
-	}}, nil
+	}}
+	s.SaveSnapshots(ctx, snaps)
+	return nil
 }

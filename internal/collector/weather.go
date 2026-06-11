@@ -11,49 +11,45 @@ import (
 
 	"github.com/adrien2121/GoProject/internal/clock"
 	"github.com/adrien2121/GoProject/internal/domain"
+	"github.com/adrien2121/GoProject/internal/httpclient"
 	"github.com/adrien2121/GoProject/internal/repository"
+	"github.com/adrien2121/GoProject/internal/runner"
 )
 
-const (
-	// SWOBURL is the production upstream. Exported so production wiring and
-	// integration tests name the same URL.
-	// Bounding box covers Ottawa proper. Returns the nearest SWOB stations.
-	SWOBURL         = "https://api.weather.gc.ca/collections/swob-realtime/items?f=json&limit=5&bbox=-75.9,45.2,-75.4,45.5&sortby=-date_tm-value"
-	weatherInterval = 30 * time.Minute
-	weatherTimeout  = 30 * time.Second
-)
+// SWOBURL is the production upstream. Exported so production wiring and
+// integration tests name the same URL.
+// Bounding box covers Ottawa proper. Returns the nearest SWOB stations.
+const SWOBURL = "https://api.weather.gc.ca/collections/swob-realtime/items?f=json&limit=5&bbox=-75.9,45.2,-75.4,45.5&sortby=-date_tm-value"
+
+const weatherInterval = 30 * time.Minute
 
 // WeatherCollector polls Environment Canada's SWOB real-time feed.
 // Stores temperature and precipitation as ExternalSignals with no hospital_id
 // since weather is regional and applies to all hospitals equally.
+//
+// Lifecycle (jitter, timeout, backoff, logging) lives in runner.Run.
+// This struct only owns the fetch/parse/save shape specific to SWOB.
 type WeatherCollector struct {
-	client HTTPGetter
+	runner.Base
+	client httpclient.Getter
 	apiURL string
 	clock  clock.Clock
 	repo   repository.ExternalSignalRepository
 	log    *slog.Logger
 }
 
-// NewWeatherCollector wires the SWOB collector.
-func NewWeatherCollector(client HTTPGetter, apiURL string, c clock.Clock, repo repository.ExternalSignalRepository, log *slog.Logger) *WeatherCollector {
-	return &WeatherCollector{client: client, apiURL: apiURL, clock: c, repo: repo, log: log}
-}
+// Compile-time check: WeatherCollector must satisfy runner.Runnable.
+var _ runner.Runnable = (*WeatherCollector)(nil)
 
-// Run loops forever collecting weather every weatherInterval.
-// The only exit is ctx cancellation (SIGINT/SIGTERM), picked up by the select
-// inside the loop. Same lifecycle pattern as the scraper orchestrator.
-func (w *WeatherCollector) Run(ctx context.Context) {
-	for {
-		collectCtx, cancel := context.WithTimeout(ctx, weatherTimeout)
-		if err := w.Collect(collectCtx); err != nil {
-			w.log.Error("weather collect failed", "err", err)
-		}
-		cancel() // release the WithTimeout timer now that collect returned; not calling it leaks a goroutine per loop
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(weatherInterval):
-		}
+// NewWeatherCollector wires the SWOB collector.
+func NewWeatherCollector(client httpclient.Getter, apiURL string, c clock.Clock, repo repository.ExternalSignalRepository, log *slog.Logger) *WeatherCollector {
+	return &WeatherCollector{
+		Base:   runner.NewBase("weather", weatherInterval),
+		client: client,
+		apiURL: apiURL,
+		clock:  c,
+		repo:   repo,
+		log:    log,
 	}
 }
 
@@ -64,8 +60,8 @@ type swobResponse struct {
 	} `json:"features"`
 }
 
-// Collect performs one fetch+save pass.
-func (w *WeatherCollector) Collect(ctx context.Context) error {
+// Run performs one fetch+save pass.
+func (w *WeatherCollector) Run(ctx context.Context) error {
 	props, raw, err := w.fetch(ctx)
 	if err != nil {
 		return err
@@ -103,8 +99,8 @@ func (w *WeatherCollector) save(ctx context.Context, props map[string]any, raw [
 		key  string
 	}{
 		{domain.SignalWeatherTempC, "air_temp"},
-		{domain.SignalWeatherPrecipMM, "pcpn-amt_pst1hr"},
-		{domain.SignalWeatherSnowCM, "sno_cu_dwl"},
+		{domain.SignalWeatherPrecipMM, "pcpn_amt_pst1hr"},
+		{domain.SignalWeatherSnowCM, "snw_dpth"},
 	}
 
 	now := w.clock.Now()
@@ -128,6 +124,8 @@ func (w *WeatherCollector) save(ctx context.Context, props map[string]any, raw [
 			ScrapedAt:  now,
 		}); err != nil {
 			w.log.Error("weather save failed", "signal", sig.name, "err", err)
+		} else {
+			w.log.Info("weather signal ok", "signal", sig.name, "value", val, "observed_at", now.Format(time.RFC3339))
 		}
 	}
 	return nil

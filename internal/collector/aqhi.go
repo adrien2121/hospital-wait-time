@@ -9,47 +9,45 @@ import (
 
 	"github.com/adrien2121/GoProject/internal/clock"
 	"github.com/adrien2121/GoProject/internal/domain"
+	"github.com/adrien2121/GoProject/internal/httpclient"
 	"github.com/adrien2121/GoProject/internal/repository"
+	"github.com/adrien2121/GoProject/internal/runner"
 )
 
-const (
-	// AQHIURL is the production upstream. Exported so production wiring and
-	// integration tests name the same URL (tests substitute an httptest.Server URL
-	// via the constructor).
-	// Ottawa bounding box; latest=true returns the single most recent AQHI reading.
-	AQHIURL      = "https://api.weather.gc.ca/collections/aqhi-observations-realtime/items?f=json&limit=1&bbox=-75.9,45.2,-75.4,45.5&latest=true"
-	aqhiInterval = 1 * time.Hour
-	aqhiTimeout  = 30 * time.Second
-)
+// AQHIURL is the production upstream. Exported so production wiring and
+// integration tests name the same URL (tests substitute an httptest.Server URL
+// via the constructor).
+// Ottawa bounding box; latest=true returns the single most recent AQHI reading.
+const AQHIURL = "https://api.weather.gc.ca/collections/aqhi-observations-realtime/items?f=json&limit=1&bbox=-75.9,45.2,-75.4,45.5&latest=true"
+
+const aqhiInterval = 1 * time.Hour
 
 // AQHICollector polls Environment Canada's real-time AQHI endpoint.
 // AQHI (Air Quality Health Index) updates hourly on a 1–10+ scale.
+//
+// Lifecycle (jitter, timeout, backoff, logging) lives in runner.Run.
+// This struct only owns the fetch/parse/save shape specific to AQHI.
 type AQHICollector struct {
-	client HTTPGetter
+	runner.Base
+	client httpclient.Getter
 	apiURL string
 	clock  clock.Clock
 	repo   repository.ExternalSignalRepository
 	log    *slog.Logger
 }
 
-// NewAQHICollector wires the AQHI collector.
-func NewAQHICollector(client HTTPGetter, apiURL string, c clock.Clock, repo repository.ExternalSignalRepository, log *slog.Logger) *AQHICollector {
-	return &AQHICollector{client: client, apiURL: apiURL, clock: c, repo: repo, log: log}
-}
+// Compile-time check: AQHICollector must satisfy runner.Runnable.
+var _ runner.Runnable = (*AQHICollector)(nil)
 
-// Run loops forever collecting AQHI every aqhiInterval.
-func (a *AQHICollector) Run(ctx context.Context) {
-	for {
-		collectCtx, cancel := context.WithTimeout(ctx, aqhiTimeout)
-		if err := a.Collect(collectCtx); err != nil {
-			a.log.Error("aqhi collect failed", "err", err)
-		}
-		cancel() // release the WithTimeout timer now that collect returned; not calling it leaks a goroutine per loop
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(aqhiInterval):
-		}
+// NewAQHICollector wires the AQHI collector.
+func NewAQHICollector(client httpclient.Getter, apiURL string, c clock.Clock, repo repository.ExternalSignalRepository, log *slog.Logger) *AQHICollector {
+	return &AQHICollector{
+		Base:   runner.NewBase("aqhi", aqhiInterval),
+		client: client,
+		apiURL: apiURL,
+		clock:  c,
+		repo:   repo,
+		log:    log,
 	}
 }
 
@@ -62,8 +60,8 @@ type aqhiResponse struct {
 	} `json:"features"`
 }
 
-// Collect performs one fetch+save pass.
-func (a *AQHICollector) Collect(ctx context.Context) error {
+// Run performs one fetch+save pass.
+func (a *AQHICollector) Run(ctx context.Context) error {
 	aqhi, observedAt, raw, err := a.fetch(ctx)
 	if err != nil {
 		return err
@@ -104,6 +102,8 @@ func (a *AQHICollector) save(ctx context.Context, aqhi float64, observedAt time.
 		ScrapedAt:  a.clock.Now(),
 	}); err != nil {
 		a.log.Error("aqhi save failed", "err", err)
+	} else {
+		a.log.Info("aqhi signal ok", "value", aqhi, "observed_at", observedAt.Format(time.RFC3339))
 	}
 	return nil
 }

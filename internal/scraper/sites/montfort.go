@@ -3,6 +3,7 @@ package sites
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -10,6 +11,9 @@ import (
 
 	"github.com/adrien2121/GoProject/internal/clock"
 	"github.com/adrien2121/GoProject/internal/domain"
+	"github.com/adrien2121/GoProject/internal/httpclient"
+	"github.com/adrien2121/GoProject/internal/repository"
+	"github.com/adrien2121/GoProject/internal/runner"
 	"github.com/adrien2121/GoProject/internal/scraper"
 )
 
@@ -21,35 +25,42 @@ const (
 	montfortInterval  = 15 * time.Minute
 )
 
-type montfortScraper struct {
+type MontfortScraper struct {
 	scraper.BaseScraper
-	client    HTTPGetter
+	client    httpclient.Getter
 	sourceURL string
 	clock     clock.Clock
 }
 
-var _ scraper.Scraper = (*montfortScraper)(nil)
+// Compile-time check: MontfortScraper must satisfy runner.Runnable.
+var _ runner.Runnable = (*MontfortScraper)(nil)
 
 // NewMontfortScraper wires the Montfort scraper. sourceURL and clock are injected
-// for the same reasons documented on NewCHEOScraper.
-func NewMontfortScraper(client HTTPGetter, sourceURL string, c clock.Clock) scraper.Scraper {
-	return &montfortScraper{
-		BaseScraper: scraper.NewBase(domain.HospitalIDMontfort, montfortInterval),
+// for the same reasons documented on NewCHEOScraper. repo and log flow through
+// to BaseScraper so Run can save snapshots without the scheduler holding the
+// repository.
+func NewMontfortScraper(client httpclient.Getter, sourceURL string, c clock.Clock, repo repository.WaitTimeRepository, log *slog.Logger) *MontfortScraper {
+	return &MontfortScraper{
+		BaseScraper: scraper.NewBase(domain.HospitalIDMontfort, montfortInterval, repo, log),
 		client:      client,
 		sourceURL:   sourceURL,
 		clock:       c,
 	}
 }
 
-func (s *montfortScraper) Scrape(ctx context.Context) ([]domain.WaitTimeSnapshot, error) {
+// Run fetches the Montfort emergency page, extracts the published median wait,
+// and saves a snapshot. The "--" branch returns ErrTransientUnavailable, which
+// wraps runner.ErrSkip so the scheduler does not bump the backoff counter for
+// upstream-reported "no data right now" states.
+func (s *MontfortScraper) Run(ctx context.Context) error {
 	body, err := s.client.Get(ctx, s.sourceURL)
 	if err != nil {
-		return nil, fmt.Errorf("montfortScraper.Scrape: %w", err)
+		return fmt.Errorf("montfortScraper.Run: %w", err)
 	}
 
 	doc, err := goquery.NewDocumentFromReader(strings.NewReader(string(body)))
 	if err != nil {
-		return nil, fmt.Errorf("montfortScraper.Scrape parse html: %w", err)
+		return fmt.Errorf("montfortScraper.Run parse html: %w", err)
 	}
 
 	// First .gros-chiffres inside the wait block is the median wait in minutes.
@@ -57,22 +68,27 @@ func (s *montfortScraper) Scrape(ctx context.Context) ([]domain.WaitTimeSnapshot
 		doc.Find(".block-content-block_nouveau_temps_d_attente .gros-chiffres").First().Text(),
 	)
 
-	// "--" means temporarily unavailable; treat as transient, not an error.
+	// "--" means temporarily unavailable. Wrap the ErrTransientUnavailable
+	// sentinel with %w so the scheduler can recognize it via errors.Is
+	// (transitively matching runner.ErrSkip) and skip backoff.
 	if waitText == "--" || waitText == "" {
-		return nil, fmt.Errorf("montfortScraper.Scrape: wait time temporarily unavailable")
+		s.Logger().Warn("scrape transient unavailable", "hospital", s.HospitalID())
+		return fmt.Errorf("montfortScraper.Run: %w", scraper.ErrTransientUnavailable)
 	}
 
 	minutes, err := scraper.ParseWaitTime(waitText)
 	if err != nil {
-		return nil, fmt.Errorf("montfortScraper.Scrape parse wait time: %w", err)
+		return fmt.Errorf("montfortScraper.Run parse wait time: %w", err)
 	}
 
 	now := s.clock.Now()
-	return []domain.WaitTimeSnapshot{{
+	snaps := []domain.WaitTimeSnapshot{{
 		HospitalID:  s.HospitalID(),
 		WaitMinutes: minutes,
 		Category:    domain.WaitCategoryTriageToDoctor,
 		RecordedAt:  now,
 		ScrapedAt:   now,
-	}}, nil
+	}}
+	s.SaveSnapshots(ctx, snaps)
+	return nil
 }

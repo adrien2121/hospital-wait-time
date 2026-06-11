@@ -13,10 +13,9 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/adrien2121/GoProject/internal/clock"
-	"github.com/adrien2121/GoProject/internal/collector"
 	"github.com/adrien2121/GoProject/internal/config"
 	"github.com/adrien2121/GoProject/internal/httpclient"
-	"github.com/adrien2121/GoProject/internal/scraper"
+	"github.com/adrien2121/GoProject/internal/runner"
 )
 
 func main() {
@@ -43,23 +42,16 @@ func run() error {
 	}
 	defer store.Close()
 
-	scrapers := buildScrapers(cfg.RateLimitPerDomainSec)
-	orch := scraper.NewOrchestrator(scrapers, store.waitTimeRepo, logger)
-
-	// Separate client so collectors don't contend with hospital scrapers.
 	httpClient := httpclient.New(cfg.RateLimitPerDomainSec)
 	clk := clock.RealClock{}
-	weather := collector.NewWeatherCollector(httpClient, collector.SWOBURL, clk, store.externalSignalRepo, logger)
-	aqhi := collector.NewAQHICollector(httpClient, collector.AQHIURL, clk, store.externalSignalRepo, logger)
+	runnables := buildRunners(httpClient, clk, store.waitTimeRepo, store.externalSignalRepo, logger)
 
-	logger.Info("scraper starting", "hospitals", len(scrapers))
+	logger.Info("scraper starting", "runnables", len(runnables))
 
 	// errgroup: any component returning an error (or panicking) cancels the others.
 	// Clean shutdown (ctx cancelled via SIGINT/SIGTERM) propagates as context.Canceled, which is not a real failure.
 	g, gctx := errgroup.WithContext(ctx)
-	g.Go(supervise(gctx, "weather", logger, weather.Run))
-	g.Go(supervise(gctx, "aqhi", logger, aqhi.Run))
-	g.Go(supervise(gctx, "orchestrator", logger, orch.Run))
+	g.Go(supervise(gctx, "runner", logger, func(ctx context.Context) { runner.Run(ctx, runnables, logger) }))
 
 	if err := g.Wait(); err != nil && !errors.Is(err, context.Canceled) {
 		return fmt.Errorf("component failed: %w", err)
@@ -69,7 +61,7 @@ func run() error {
 }
 
 // supervise wraps a long-running Run(ctx) so panics surface as group errors.
-// Without this, a panic in one collector would crash the whole process with no structured log.
+// Without this, a panic in one Runnable goroutine would crash the whole process with no structured log.
 // Returning nil on normal exit lets ctx cancellation propagate as the group's first error.
 func supervise(ctx context.Context, name string, logger *slog.Logger, run func(context.Context)) func() error {
 	return func() (err error) {
